@@ -48,8 +48,11 @@ Removing that file restores the original startup command and stop timeout.
 Set `BOR_DELIVERY_EXPERIMENT` to a JSON object with UTC `start`, UTC `end`, and an absolute trace `path`.
 Limit the interval to 30 minutes. Start within 30 minutes of node startup. Use a new output file.
 
-The node assigns unknown announced hashes to 100 ms or 500 ms with a private random seed.
-Assignment uses the hash before the body is available. The matching gathering slack is 20 ms or 100 ms.
+Set `waitsMs` to `[10,100]` for the fast trial or `[100,500]` for the original trial.
+Omit `waitsMs` to retain the original pair. Other pairs disable the experiment.
+The node assigns unknown announced hashes to the selected pair with a private random seed.
+Assignment uses the hash before the body is available. The matching gathering slack is one fifth of the assigned wait, capped at 100 ms.
+The 10 ms arm uses 2 ms slack. The 100 ms arm uses 20 ms slack.
 Mixed timer events can gather control hashes after 400 ms. Report observed request times for each arm.
 Full broadcasts, validation, peer caps, request correlation, rate limits, and timeouts retain their existing paths.
 

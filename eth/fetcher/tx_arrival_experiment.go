@@ -19,6 +19,7 @@ import (
 type arrivalExperiment struct {
 	start, end time.Time
 	seed       [32]byte
+	waits      [2]time.Duration
 	events     chan arrivalEvent
 	disabled   atomic.Bool
 }
@@ -34,9 +35,10 @@ type arrivalEvent struct {
 }
 
 type arrivalExperimentConfig struct {
-	Start time.Time `json:"start"`
-	End   time.Time `json:"end"`
-	Path  string    `json:"path"`
+	Start   time.Time `json:"start"`
+	End     time.Time `json:"end"`
+	Path    string    `json:"path"`
+	WaitsMS [2]int    `json:"waitsMs"`
 }
 
 func newArrivalExperiment() *arrivalExperiment {
@@ -49,6 +51,11 @@ func newArrivalExperiment() *arrivalExperiment {
 		log.Error("Invalid delivery experiment configuration", "err", err)
 		return nil
 	}
+	waits, valid := experimentArrivalWaits(config.WaitsMS)
+	if !valid {
+		log.Error("Unsupported delivery experiment wait pair")
+		return nil
+	}
 	now := time.Now()
 	if !config.End.After(now) || config.End.Sub(config.Start) > 30*time.Minute || !config.End.After(config.Start) || config.Start.Sub(now) > 30*time.Minute || config.Path == "" {
 		log.Error("Delivery experiment outside allowed interval")
@@ -59,7 +66,7 @@ func newArrivalExperiment() *arrivalExperiment {
 		log.Error("Delivery trace unavailable", "err", err)
 		return nil
 	}
-	experiment := &arrivalExperiment{start: config.Start, end: config.End, events: make(chan arrivalEvent, 8192)}
+	experiment := &arrivalExperiment{start: config.Start, end: config.End, waits: waits, events: make(chan arrivalEvent, 8192)}
 	if _, err := rand.Read(experiment.seed[:]); err != nil {
 		if closeErr := file.Close(); closeErr != nil {
 			log.Error("Close delivery trace", "err", closeErr)
@@ -68,7 +75,7 @@ func newArrivalExperiment() *arrivalExperiment {
 		return nil
 	}
 	go experiment.write(file)
-	log.Info("Delivery experiment enabled", "start", config.Start, "end", config.End)
+	log.Info("Delivery experiment enabled", "start", config.Start, "end", config.End, "fast", waits[0], "control", waits[1])
 	return experiment
 }
 
@@ -84,10 +91,11 @@ func (e *arrivalExperiment) assign(hash common.Hash) time.Duration {
 	copy(input[:32], e.seed[:])
 	copy(input[32:], hash[:])
 	digest := sha256.Sum256(input[:])
-	wait := 100 * time.Millisecond
-	if digest[0]&1 != 0 {
-		wait = 500 * time.Millisecond
+	waits := e.waits
+	if waits == [2]time.Duration{} {
+		waits = [2]time.Duration{100 * time.Millisecond, 500 * time.Millisecond}
 	}
+	wait := waits[digest[0]&1]
 	e.record(hash, "enroll", false, "", wait.Milliseconds())
 	return wait
 }
@@ -159,5 +167,17 @@ func (e *arrivalExperiment) write(file *os.File) {
 			log.Info("Delivery experiment trace complete", "bytes", bytes, "incomplete", e.disabled.Load())
 			return
 		}
+	}
+}
+
+// Restrict operator input to reviewed pairs. Zero preserves the original trial.
+func experimentArrivalWaits(input [2]int) ([2]time.Duration, bool) {
+	switch input {
+	case [2]int{}, [2]int{100, 500}:
+		return [2]time.Duration{100 * time.Millisecond, 500 * time.Millisecond}, true
+	case [2]int{10, 100}:
+		return [2]time.Duration{10 * time.Millisecond, 100 * time.Millisecond}, true
+	default:
+		return [2]time.Duration{}, false
 	}
 }

@@ -8,8 +8,9 @@ import (
 	"github.com/ethereum/go-ethereum/common/mclock"
 )
 
-func TestArrivalWaitExperimentStableAndExpires(t *testing.T) {
-	e := &arrivalExperiment{start: time.Now().Add(-time.Minute), end: time.Now().Add(time.Minute), events: make(chan arrivalEvent, 4096)}
+func testArrivalWaitExperimentStableAndExpires(t *testing.T, waits [2]time.Duration) {
+	t.Helper()
+	e := &arrivalExperiment{start: time.Now().Add(-time.Minute), end: time.Now().Add(time.Minute), waits: waits, events: make(chan arrivalEvent, 4096)}
 	counts := map[time.Duration]int{}
 	for i := 0; i < 1000; i++ {
 		hash := common.BigToHash(common.Big1)
@@ -20,7 +21,7 @@ func TestArrivalWaitExperimentStableAndExpires(t *testing.T) {
 		}
 		counts[wait]++
 	}
-	for _, wait := range []time.Duration{100 * time.Millisecond, 500 * time.Millisecond} {
+	for _, wait := range waits {
 		if counts[wait] < 400 || counts[wait] > 600 {
 			t.Fatalf("unbalanced policy: %v", counts)
 		}
@@ -28,6 +29,12 @@ func TestArrivalWaitExperimentStableAndExpires(t *testing.T) {
 	e.end = time.Now().Add(-time.Second)
 	if e.assign(common.Hash{}) != 0 {
 		t.Fatal("enrolled after expiry")
+	}
+}
+
+func TestArrivalWaitExperimentStableAndExpires(t *testing.T) {
+	for _, waits := range [][2]time.Duration{{100 * time.Millisecond, 500 * time.Millisecond}, {10 * time.Millisecond, 100 * time.Millisecond}} {
+		t.Run(waits[0].String(), func(t *testing.T) { testArrivalWaitExperimentStableAndExpires(t, waits) })
 	}
 }
 
@@ -71,12 +78,13 @@ func TestArrivalWaitExperimentEarlierDeadline(t *testing.T) {
 	(*timer).Stop()
 }
 
-func TestArrivalWaitExperimentMixedScheduling(t *testing.T) {
-	e := &arrivalExperiment{start: time.Now().Add(-time.Minute), end: time.Now().Add(time.Minute), events: make(chan arrivalEvent, 4096)}
+func testArrivalWaitExperimentMixedScheduling(t *testing.T, fastWait, slowWait time.Duration) {
+	t.Helper()
+	e := &arrivalExperiment{start: time.Now().Add(-time.Minute), end: time.Now().Add(time.Minute), waits: [2]time.Duration{fastWait, slowWait}, events: make(chan arrivalEvent, 4096)}
 	var fast, slow common.Hash
 	for i := 1; i < 256; i++ {
 		hash := common.Hash{byte(i)}
-		if e.assign(hash) == 100*time.Millisecond {
+		if e.assign(hash) == fastWait {
 			fast = hash
 		} else {
 			slow = hash
@@ -94,9 +102,9 @@ func TestArrivalWaitExperimentMixedScheduling(t *testing.T) {
 		},
 		steps: []interface{}{
 			doTxNotify{peer: "slow", hashes: []common.Hash{slow}},
-			doWait{time: 10 * time.Millisecond},
+			doWait{time: time.Millisecond},
 			doTxNotify{peer: "fast", hashes: []common.Hash{fast}},
-			doWait{time: 100 * time.Millisecond, step: true},
+			doWait{time: fastWait, step: true},
 			doFunc(func() {
 				select {
 				case peer := <-calls:
@@ -107,7 +115,7 @@ func TestArrivalWaitExperimentMixedScheduling(t *testing.T) {
 					t.Fatal("fast request missing")
 				}
 			}),
-			doWait{time: 390 * time.Millisecond, step: true},
+			doWait{time: slowWait - fastWait - time.Millisecond, step: true},
 			doFunc(func() {
 				select {
 				case peer := <-calls:
@@ -120,4 +128,28 @@ func TestArrivalWaitExperimentMixedScheduling(t *testing.T) {
 			}),
 		},
 	})
+}
+
+func TestArrivalWaitExperimentMixedScheduling(t *testing.T) {
+	for _, waits := range [][2]time.Duration{{100 * time.Millisecond, 500 * time.Millisecond}, {10 * time.Millisecond, 100 * time.Millisecond}} {
+		t.Run(waits[0].String(), func(t *testing.T) { testArrivalWaitExperimentMixedScheduling(t, waits[0], waits[1]) })
+	}
+}
+
+func TestArrivalWaitExperimentPairs(t *testing.T) {
+	for _, tc := range []struct {
+		input [2]int
+		valid bool
+	}{
+		{[2]int{}, true}, {[2]int{10, 100}, true}, {[2]int{100, 500}, true},
+		{[2]int{0, 100}, false}, {[2]int{-1, 100}, false}, {[2]int{100, 10}, false}, {[2]int{10, 10}, false}, {[2]int{1, 100}, false}, {[2]int{10, 5000}, false},
+	} {
+		waits, valid := experimentArrivalWaits(tc.input)
+		if valid != tc.valid {
+			t.Fatalf("pair %v validity %v", tc.input, valid)
+		}
+		if valid && (waits[0] <= 0 || waits[1] <= waits[0]) {
+			t.Fatal("invalid accepted durations")
+		}
+	}
 }

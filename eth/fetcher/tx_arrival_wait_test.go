@@ -10,7 +10,7 @@ import (
 )
 
 func TestConfiguredTransactionArrivalWait(t *testing.T) {
-	for _, wait := range []time.Duration{100 * time.Millisecond, 500 * time.Millisecond} {
+	for _, wait := range []time.Duration{10 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond} {
 		t.Run(wait.String(), func(t *testing.T) {
 			calls := make(chan struct{}, 16)
 			testTransactionFetcher(t, txFetcherTest{
@@ -40,7 +40,7 @@ func TestConfiguredTransactionArrivalWait(t *testing.T) {
 }
 
 func TestConfiguredArrivalBroadcastCancelsRequest(t *testing.T) {
-	for _, wait := range []time.Duration{100 * time.Millisecond, 500 * time.Millisecond} {
+	for _, wait := range []time.Duration{10 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond} {
 		t.Run(wait.String(), func(t *testing.T) {
 			calls := make(chan struct{}, 16)
 			testTransactionFetcher(t, txFetcherTest{
@@ -68,6 +68,7 @@ func TestArrivalWaitDefaultsAndSlack(t *testing.T) {
 	for _, tc := range []struct{ input, want, slack time.Duration }{
 		{0, 500 * time.Millisecond, 100 * time.Millisecond},
 		{-time.Second, 500 * time.Millisecond, 100 * time.Millisecond},
+		{10 * time.Millisecond, 10 * time.Millisecond, 2 * time.Millisecond},
 		{100 * time.Millisecond, 100 * time.Millisecond, 20 * time.Millisecond},
 		{500 * time.Millisecond, 500 * time.Millisecond, 100 * time.Millisecond},
 		{time.Second, time.Second, 100 * time.Millisecond},
@@ -95,7 +96,7 @@ func TestConfiguredArrivalSlackKeepsYoungAnnouncements(t *testing.T) {
 }
 
 func TestConfiguredArrivalRetrievalLimits(t *testing.T) {
-	for _, wait := range []time.Duration{100 * time.Millisecond, 500 * time.Millisecond} {
+	for _, wait := range []time.Duration{10 * time.Millisecond, 100 * time.Millisecond, 500 * time.Millisecond} {
 		for _, size := range []uint32{111, 64 * 1024} {
 			t.Run(fmt.Sprintf("%s/%d", wait, size), func(t *testing.T) {
 				var f *TxFetcher
