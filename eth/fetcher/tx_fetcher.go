@@ -101,9 +101,11 @@ var (
 // txAnnounce is the notification of the availability of a batch
 // of new transactions in the network.
 type txAnnounce struct {
-	origin string        // Identifier of the peer originating the notification
-	hashes []common.Hash // Batch of transaction hashes being announced
-	metas  []*txMetadata // Batch of metadatas associated with the hashes (nil before eth/68)
+	received  time.Time
+	monotonic mclock.AbsTime
+	origin    string        // Identifier of the peer originating the notification
+	hashes    []common.Hash // Batch of transaction hashes being announced
+	metas     []*txMetadata // Batch of metadatas associated with the hashes (nil before eth/68)
 }
 
 // txMetadata provides the extra data transmitted along with the announcement
@@ -159,6 +161,12 @@ type txDrop struct {
 //     abandoned request is dead on the wire; the request ID echoed in
 //     PooledTransactionsMsg identifies stale replies from abandoned requests.
 type TxFetcher struct {
+	arrivalWait  time.Duration
+	arrivalSlack time.Duration
+	experiment   *arrivalExperiment
+	waitPolicy   map[common.Hash]time.Duration
+	waitDeadline mclock.AbsTime
+
 	notify  chan *txAnnounce
 	cleanup chan *txDelivery
 	drop    chan *txDrop
@@ -203,6 +211,19 @@ func NewTxFetcher(hasTx func(common.Hash) bool, addTxs func([]*types.Transaction
 	return NewTxFetcherForTests(hasTx, addTxs, fetchTxs, dropPeer, mclock.System{}, time.Now, nil)
 }
 
+// NewTxFetcherWithArrivalWait changes only the initial body wait. Peer limits,
+// request timeouts and pool validation use the existing paths.
+func NewTxFetcherWithArrivalWait(hasTx func(common.Hash) bool, addTxs func([]*types.Transaction) []error, fetchTxs func(string, uint64, []common.Hash) error, dropPeer func(string), wait time.Duration) *TxFetcher {
+	f := NewTxFetcher(hasTx, addTxs, fetchTxs, dropPeer)
+	if wait > 0 {
+		f.arrivalWait = wait
+		f.arrivalSlack = min(txGatherSlack, wait/5)
+	}
+	f.experiment = newArrivalExperiment()
+	log.Info("Transaction fetcher arrival grace", "wait", f.arrivalWait, "gather", f.arrivalSlack)
+	return f
+}
+
 // NewTxFetcherForTests is a testing method to mock out the realtime clock with
 // a simulated version and the internal randomness with a deterministic one.
 func NewTxFetcherForTests(
@@ -213,27 +234,30 @@ func NewTxFetcherForTests(
 		requestIDs = mrand.New(mrand.NewSource(reqIDTestSeed))
 	}
 	return &TxFetcher{
-		notify:      make(chan *txAnnounce),
-		cleanup:     make(chan *txDelivery),
-		drop:        make(chan *txDrop),
-		quit:        make(chan struct{}),
-		waitlist:    make(map[common.Hash]map[string]struct{}),
-		waittime:    make(map[common.Hash]mclock.AbsTime),
-		waitslots:   make(map[string]map[common.Hash]*txMetadata),
-		announces:   make(map[string]map[common.Hash]*txMetadata),
-		announced:   make(map[common.Hash]map[string]struct{}),
-		fetching:    make(map[common.Hash]string),
-		requests:    make(map[string]*txRequest),
-		alternates:  make(map[common.Hash]map[string]struct{}),
-		underpriced: lru.NewCache[common.Hash, time.Time](maxTxUnderpricedSetSize),
-		hasTx:       hasTx,
-		addTxs:      addTxs,
-		fetchTxs:    fetchTxs,
-		dropPeer:    dropPeer,
-		clock:       clock,
-		realTime:    realTime,
-		rand:        rand,
-		requestIDs:  requestIDs,
+		arrivalWait:  txArriveTimeout,
+		arrivalSlack: txGatherSlack,
+		notify:       make(chan *txAnnounce),
+		cleanup:      make(chan *txDelivery),
+		drop:         make(chan *txDrop),
+		quit:         make(chan struct{}),
+		waitlist:     make(map[common.Hash]map[string]struct{}),
+		waittime:     make(map[common.Hash]mclock.AbsTime),
+		waitPolicy:   make(map[common.Hash]time.Duration),
+		waitslots:    make(map[string]map[common.Hash]*txMetadata),
+		announces:    make(map[string]map[common.Hash]*txMetadata),
+		announced:    make(map[common.Hash]map[string]struct{}),
+		fetching:     make(map[common.Hash]string),
+		requests:     make(map[string]*txRequest),
+		alternates:   make(map[common.Hash]map[string]struct{}),
+		underpriced:  lru.NewCache[common.Hash, time.Time](maxTxUnderpricedSetSize),
+		hasTx:        hasTx,
+		addTxs:       addTxs,
+		fetchTxs:     fetchTxs,
+		dropPeer:     dropPeer,
+		clock:        clock,
+		realTime:     realTime,
+		rand:         rand,
+		requestIDs:   requestIDs,
 	}
 }
 
@@ -242,6 +266,10 @@ func NewTxFetcherForTests(
 func (f *TxFetcher) Notify(peer string, types []byte, sizes []uint32, hashes []common.Hash) error {
 	// Keep track of all the announced transactions
 	txAnnounceInMeter.Mark(int64(len(hashes)))
+	received, monotonic := time.Time{}, mclock.AbsTime(0)
+	if f.experiment != nil {
+		received, monotonic = time.Now(), mclock.Now()
+	}
 
 	// Skip any transaction announcements that we already know of, or that we've
 	// previously marked as cheap and discarded. This check is of course racy,
@@ -278,7 +306,7 @@ func (f *TxFetcher) Notify(peer string, types []byte, sizes []uint32, hashes []c
 	if len(unknownHashes) == 0 {
 		return nil
 	}
-	announce := &txAnnounce{origin: peer, hashes: unknownHashes, metas: unknownMetas}
+	announce := &txAnnounce{origin: peer, hashes: unknownHashes, metas: unknownMetas, received: received, monotonic: monotonic}
 	select {
 	case f.notify <- announce:
 		return nil
@@ -319,6 +347,10 @@ func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool, 
 	// Keep track of all the propagated transactions
 	inMeter.Mark(int64(len(txs)))
 
+	for _, tx := range txs {
+		f.experiment.record(tx.Hash(), "body", direct, "", 0)
+	}
+
 	// Push all the transactions into the pool, tracking underpriced ones to avoid
 	// re-requesting them and dropping the peer in case of malicious transfers.
 	var (
@@ -341,6 +373,11 @@ func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool, 
 		batch := txs[i:end]
 
 		for j, err := range f.addTxs(batch) {
+			result := "accepted"
+			if err != nil {
+				result = "rejected"
+			}
+			f.experiment.record(batch[j].Hash(), "pool", direct, result, 0)
 			// Track the transaction hash if the price is too low for us.
 			// Avoid re-request this transaction when we receive another
 			// announcement.
@@ -459,6 +496,7 @@ func (f *TxFetcher) loop() {
 			}
 			// All is well, schedule the remainder of the transactions
 			idleWait := len(f.waittime) == 0
+			earlierWait := false
 			_, oldPeer := f.announces[ann.origin]
 
 			for i, hash := range ann.hashes {
@@ -511,9 +549,19 @@ func (f *TxFetcher) loop() {
 
 					continue
 				}
+				// Record only the first accepted announcement, after the existing peer cap.
+				if f.experiment != nil {
+					f.experiment.emit(arrivalEvent{Hash: hash, Stage: "announce", UnixNS: ann.received.UnixNano(), MonoNS: int64(ann.monotonic)})
+				}
 				// Transaction unknown to the fetcher, insert it into the waiting list
 				f.waitlist[hash] = map[string]struct{}{ann.origin: {}}
 				f.waittime[hash] = f.clock.Now()
+				if wait := f.experiment.assign(hash); wait > 0 {
+					f.waitPolicy[hash] = wait
+					if f.waittime[hash].Add(wait) < f.waitDeadline {
+						earlierWait = true
+					}
+				}
 
 				if waitslots := f.waitslots[ann.origin]; waitslots != nil {
 					waitslots[hash] = ann.metas[i]
@@ -522,7 +570,7 @@ func (f *TxFetcher) loop() {
 				}
 			}
 			// If a new item was added to the waitlist, schedule it into the fetcher
-			if idleWait && len(f.waittime) > 0 {
+			if (idleWait || earlierWait) && len(f.waittime) > 0 {
 				f.rescheduleWait(waitTimer, waitTrigger)
 			}
 			// If this peer is new and announced something already queued, maybe
@@ -537,7 +585,8 @@ func (f *TxFetcher) loop() {
 			actives := make(map[string]struct{})
 
 			for hash, instance := range f.waittime {
-				if time.Duration(f.clock.Now()-instance)+txGatherSlack > txArriveTimeout {
+				wait, slack := f.arrivalPolicy(hash)
+				if time.Duration(f.clock.Now()-instance)+slack > wait {
 					// Transaction expired without propagation, schedule for retrieval
 					if f.announced[hash] != nil {
 						panic("announce tracker already contains waitlist item")
@@ -561,6 +610,7 @@ func (f *TxFetcher) loop() {
 					}
 
 					delete(f.waittime, hash)
+					delete(f.waitPolicy, hash)
 					delete(f.waitlist, hash)
 				}
 			}
@@ -679,6 +729,7 @@ func (f *TxFetcher) loop() {
 
 					delete(f.waitlist, hash)
 					delete(f.waittime, hash)
+					delete(f.waitPolicy, hash)
 				} else {
 					for peer, txset := range f.announces {
 						if meta := txset[hash]; meta != nil {
@@ -816,6 +867,7 @@ func (f *TxFetcher) loop() {
 					if len(f.waitlist[hash]) == 0 {
 						delete(f.waitlist, hash)
 						delete(f.waittime, hash)
+						delete(f.waitPolicy, hash)
 					}
 				}
 
@@ -896,9 +948,8 @@ func (f *TxFetcher) loop() {
 // rescheduleWait iterates over all the transactions currently in the waitlist
 // and schedules the movement into the fetcher for the earliest.
 //
-// The method has a granularity of 'txGatherSlack', since there's not much point in
-// spinning over all the transactions just to maybe find one that should trigger
-// a few ms earlier.
+// The wait timer tracks the earliest announcement. The expiry handler uses
+// arrivalSlack to gather nearby announcements into the same request.
 func (f *TxFetcher) rescheduleWait(timer *mclock.Timer, trigger chan struct{}) {
 	if *timer != nil {
 		(*timer).Stop()
@@ -906,18 +957,20 @@ func (f *TxFetcher) rescheduleWait(timer *mclock.Timer, trigger chan struct{}) {
 
 	now := f.clock.Now()
 
-	earliest := now
-	for _, instance := range f.waittime {
-		if earliest > instance {
-			earliest = instance
-			if txArriveTimeout-time.Duration(now-earliest) < txGatherSlack {
-				break
-			}
-		}
+	delay := f.arrivalWait
+	if len(f.waittime) > 0 {
+		delay = time.Duration(math.MaxInt64)
 	}
-
-	*timer = f.clock.AfterFunc(txArriveTimeout-time.Duration(now-earliest), func() {
-		trigger <- struct{}{}
+	for hash, instance := range f.waittime {
+		wait, _ := f.arrivalPolicy(hash)
+		delay = min(delay, wait-time.Duration(now-instance))
+	}
+	f.waitDeadline = now.Add(max(0, delay))
+	*timer = f.clock.AfterFunc(max(0, delay), func() {
+		select {
+		case trigger <- struct{}{}:
+		default:
+		}
 	})
 }
 
@@ -1067,6 +1120,9 @@ func (f *TxFetcher) scheduleFetches(timer *mclock.Timer, timeout chan struct{}, 
 			go func(peer string, requestID uint64, hashes []common.Hash) {
 				// Try to fetch the transactions, but in case of a request
 				// failure (e.g. peer disconnected), reschedule the hashes.
+				for _, hash := range hashes {
+					f.experiment.record(hash, "request", true, "", 0)
+				}
 				if err := f.fetchTxs(peer, requestID, hashes); err != nil {
 					txRequestFailMeter.Mark(int64(len(hashes)))
 					f.Drop(peer)
@@ -1174,4 +1230,11 @@ func rotateHashes(slice []common.Hash, n int) {
 	for i := 0; i < len(orig); i++ {
 		slice[i] = orig[(i+n)%len(orig)]
 	}
+}
+
+func (f *TxFetcher) arrivalPolicy(hash common.Hash) (time.Duration, time.Duration) {
+	if wait := f.waitPolicy[hash]; wait > 0 {
+		return wait, min(txGatherSlack, wait/5)
+	}
+	return f.arrivalWait, f.arrivalSlack
 }
