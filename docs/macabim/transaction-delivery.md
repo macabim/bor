@@ -42,3 +42,23 @@ It sets the explicit 100 ms command-line override and allows graceful shutdown t
 It preserves the base unit's environment, user, restart policy and data-directory config.
 Install it as `/etc/systemd/system/bor.service.d/30-macabim-delivery.conf` during the trial.
 Removing that file restores the original startup command and stop timeout.
+
+## Bounded live comparison
+
+Set `BOR_DELIVERY_EXPERIMENT` to a JSON object with UTC `start`, UTC `end`, and an absolute trace `path`.
+Limit the interval to 30 minutes. Start within 30 minutes of node startup. Use a new output file.
+
+The node assigns unknown announced hashes to 100 ms or 500 ms with a private random seed.
+Assignment uses the hash before the body is available. The matching gathering slack is 20 ms or 100 ms.
+Mixed timer events can gather control hashes after 400 ms. Report observed request times for each arm.
+Full broadcasts, validation, peer caps, request correlation, rate limits, and timeouts retain their existing paths.
+
+The trace records announcement, enrollment, request, body, and pool result timestamps. It excludes transaction contents and peer identities.
+A nonblocking queue holds 8,192 events. The file limit is 256 MiB. Queue overflow or write failure disables new enrollment.
+Treat any incomplete trace as an invalid trial. Existing assigned hashes finish with their assigned wait.
+The writer exits 15 seconds after expiry. Later hashes use the configured node wait.
+
+Join hashes with Tamnun publication and Trader stage records on the same host.
+Report alternate-provider wins and missing observations. Separate body-first traffic from the randomized hash-first cohort.
+Compare readiness rates at fixed deadlines across all enrolled hashes. Conditional useful-target times are descriptive.
+Do not infer a same-transaction improvement from different transactions or claim profit from latency alone.
