@@ -1,0 +1,65 @@
+name: Macabim transaction delivery
+
+on:
+  push:
+    branches: ['codex/polygon-delivery-prototype']
+  pull_request:
+    branches: ['master']
+    paths:
+      - 'eth/backend.go'
+      - 'eth/handler.go'
+      - 'eth/fetcher/**'
+      - '.github/workflows/macabim-delivery.yml'
+      - 'build/macabim/bor-delivery.conf'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macabim-delivery-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      GOMAXPROCS: '2'
+      SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - name: Transaction fetcher tests
+        run: go test ./eth/fetcher -run '^Test(TransactionFetcher|Configured|ArrivalWait)' -count=1 -timeout=10m
+      - name: Transaction safety race tests
+        run: >-
+          go test -race ./eth/fetcher
+          -run '^Test(Configured|ArrivalWait|TransactionFetcher(Waiting|SingletonRequesting|FailedRescheduling|Cleanup|Broadcasts|WaitTimerResets|Timeout|RateLimiting|BandwidthLimiting|Drop|Dangling|Stale|Unrelated|NonOverlapping|DeliveryViolation|Genuine|Unsolicited))'
+          -count=1 -timeout=5m
+      - name: Static checks
+        run: go vet ./eth/fetcher ./eth
+      - name: Lint changed packages
+        run: |
+          make lint-deps
+          ./build/bin/golangci-lint run ./eth/fetcher ./eth --timeout=5m
+      - name: Build Linux binary from reviewed commit
+        run: |
+          mkdir -p dist
+          go build -trimpath -p 2 -pgo=prod.pprof -ldflags "-X github.com/ethereum/go-ethereum/params.GitCommit=$SOURCE_COMMIT" -o dist/bor-linux-amd64 ./cmd/cli
+          printf '%s\n' "$SOURCE_COMMIT" > dist/SOURCE_COMMIT
+          cp build/macabim/bor-delivery.conf dist/
+          cd dist
+          sha256sum bor-linux-amd64 bor-delivery.conf > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bor-delivery-${{ env.SOURCE_COMMIT }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

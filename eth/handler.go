@@ -116,6 +116,7 @@ type txPool interface {
 // handlerConfig is the collection of initialization parameters to create a full
 // node network handler.
 type handlerConfig struct {
+	txArrivalWait           time.Duration
 	NodeID                  enode.ID            // P2P node ID used for tx propagation topology
 	Database                ethdb.Database      // Database for direct sync insertions
 	Chain                   *core.BlockChain    // Blockchain to serve data from
@@ -406,7 +407,7 @@ func newHandler(config *handlerConfig) (*handler, error) {
 	addTxs := func(txs []*types.Transaction) []error {
 		return h.txpool.Add(txs, false)
 	}
-	h.txFetcher = fetcher.NewTxFetcher(h.txpool.Has, addTxs, fetchTx, h.removePeer)
+	h.txFetcher = fetcher.NewTxFetcherWithArrivalWait(h.txpool.Has, addTxs, fetchTx, h.removePeer, config.txArrivalWait)
 	h.chainSync = newChainSyncer(h)
 
 	return h, nil
