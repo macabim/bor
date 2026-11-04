@@ -65,3 +65,12 @@ Join hashes with Tamnun publication and Trader stage records on the same host.
 Report alternate-provider wins and missing observations. Separate body-first traffic from the randomized hash-first cohort.
 Compare readiness rates at fixed deadlines across all enrolled hashes. Conditional useful-target times are descriptive.
 Do not infer a same-transaction improvement from different transactions or claim profit from latency alone.
+
+
+## Maintained fork deployment
+
+Build production artifacts from `macabim/bor` branch `main`.
+Verify the binary commit against that branch before installation.
+Use the packaged service drop-in for the permanent 10 ms arrival wait.
+Keep the config file, data directory, validation, and peer limits unchanged.
+Record the source commit, artifact checksum, and rollback binary with each deployment.

@@ -1,10 +1,11 @@
 name: Macabim transaction delivery
 
 on:
+  workflow_dispatch:
   push:
-    branches: ['codex/polygon-delivery-prototype']
+    branches: ['main', 'codex/polygon-delivery-prototype']
   pull_request:
-    branches: ['master']
+    branches: ['main', 'master']
     paths:
       - 'eth/backend.go'
       - 'eth/handler.go'
