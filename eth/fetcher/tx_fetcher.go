@@ -101,9 +101,11 @@ var (
 // txAnnounce is the notification of the availability of a batch
 // of new transactions in the network.
 type txAnnounce struct {
-	origin string        // Identifier of the peer originating the notification
-	hashes []common.Hash // Batch of transaction hashes being announced
-	metas  []*txMetadata // Batch of metadatas associated with the hashes (nil before eth/68)
+	received  time.Time
+	monotonic mclock.AbsTime
+	origin    string        // Identifier of the peer originating the notification
+	hashes    []common.Hash // Batch of transaction hashes being announced
+	metas     []*txMetadata // Batch of metadatas associated with the hashes (nil before eth/68)
 }
 
 // txMetadata provides the extra data transmitted along with the announcement
@@ -264,6 +266,10 @@ func NewTxFetcherForTests(
 func (f *TxFetcher) Notify(peer string, types []byte, sizes []uint32, hashes []common.Hash) error {
 	// Keep track of all the announced transactions
 	txAnnounceInMeter.Mark(int64(len(hashes)))
+	received, monotonic := time.Time{}, mclock.AbsTime(0)
+	if f.experiment != nil {
+		received, monotonic = time.Now(), mclock.Now()
+	}
 
 	// Skip any transaction announcements that we already know of, or that we've
 	// previously marked as cheap and discarded. This check is of course racy,
@@ -284,7 +290,6 @@ func (f *TxFetcher) Notify(peer string, types []byte, sizes []uint32, hashes []c
 		case f.isKnownUnderpriced(hash):
 			underpriced++
 		default:
-			f.experiment.record(hash, "announce", false, "", 0)
 			unknownHashes = append(unknownHashes, hash)
 			if types == nil {
 				unknownMetas = append(unknownMetas, nil)
@@ -301,7 +306,7 @@ func (f *TxFetcher) Notify(peer string, types []byte, sizes []uint32, hashes []c
 	if len(unknownHashes) == 0 {
 		return nil
 	}
-	announce := &txAnnounce{origin: peer, hashes: unknownHashes, metas: unknownMetas}
+	announce := &txAnnounce{origin: peer, hashes: unknownHashes, metas: unknownMetas, received: received, monotonic: monotonic}
 	select {
 	case f.notify <- announce:
 		return nil
@@ -543,6 +548,10 @@ func (f *TxFetcher) loop() {
 					}
 
 					continue
+				}
+				// Record only the first accepted announcement, after the existing peer cap.
+				if f.experiment != nil {
+					f.experiment.emit(arrivalEvent{Hash: hash, Stage: "announce", UnixNS: ann.received.UnixNano(), MonoNS: int64(ann.monotonic)})
 				}
 				// Transaction unknown to the fetcher, insert it into the waiting list
 				f.waitlist[hash] = map[string]struct{}{ann.origin: {}}

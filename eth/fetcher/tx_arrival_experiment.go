@@ -97,6 +97,13 @@ func (e *arrivalExperiment) record(hash common.Hash, stage string, direct bool, 
 		return
 	}
 	event := arrivalEvent{hash, stage, time.Now().UnixNano(), int64(mclock.Now()), direct, result, waitMS}
+	e.emit(event)
+}
+
+func (e *arrivalExperiment) emit(event arrivalEvent) {
+	if e == nil || e.disabled.Load() {
+		return
+	}
 	select {
 	case e.events <- event:
 	default:
