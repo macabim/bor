@@ -16,12 +16,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: macabim-delivery-${{ github.event.pull_request.head.sha || github.sha }}
+  group: macabim-delivery-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   validate-and-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
       GOMAXPROCS: '2'
